@@ -1406,6 +1406,7 @@ dependencies = [
  "ghidrust-net-schema",
  "ghidrust-types",
  "ghidrust-unity-inventory",
+ "rayon",
  "serde",
  "serde_json",
  "winres",

@@ -5,7 +5,7 @@
 
 use crate::analyzers::run_analyzers;
 use crate::error::Result;
-use crate::pe_functions::{create_function_with_kind, runtime_function_containing};
+use crate::pe_functions::{create_function_with_kind, grow_function, runtime_function_containing};
 use crate::program::{FunctionInfo, FunctionSeedKind, Program};
 use serde::{Deserialize, Serialize};
 
@@ -159,8 +159,10 @@ pub fn resolve_function(prog: &mut Program, addr: u64) -> Result<ResolveResult> 
         }
     }
 
+    let mut ran_fss = false;
     if prog.analysis.functions.is_empty() {
         let _ = run_analyzers(prog, &["Function Start Search"])?;
+        ran_fss = true;
     }
 
     if let Some(r) = try_resolve_covering(prog, addr) {
@@ -175,8 +177,12 @@ pub fn resolve_function(prog: &mut Program, addr: u64) -> Result<ResolveResult> 
         ));
     }
 
-    // Orphan executable VA: re-run FSS/PE once, then pdata-heal or synthesize.
-    let _ = run_analyzers(prog, &["Function Start Search"])?;
+    // Orphan executable VA: re-run FSS/PE once (only when it has not already
+    // run in this call — a rebuild of an already-built table is idempotent),
+    // then pdata-heal or synthesize.
+    if !ran_fss {
+        let _ = run_analyzers(prog, &["Function Start Search"])?;
+    }
     if let Some(r) = try_resolve_covering(prog, addr) {
         return Ok(r);
     }
@@ -200,6 +206,94 @@ pub fn resolve_function(prog: &mut Program, addr: u64) -> Result<ResolveResult> 
         Some(format!("SYNTH_{addr:08x}")),
     );
     Ok(ok_from(addr, &f, ResolveStatus::Synthesized, false, vec![]))
+}
+
+/// Outcome of a non-mutating resolve pass.
+#[derive(Debug, Clone)]
+pub struct PureResolve {
+    pub result: ResolveResult,
+    /// Function that the mutating [`resolve_function`] would have inserted into
+    /// `prog.analysis.functions` (pdata heal or orphan synth). `None` when the
+    /// address resolved against already-present functions.
+    pub created: Option<FunctionInfo>,
+}
+
+/// Non-mutating variant of [`resolve_function`] for batch decompile loops.
+///
+/// The caller must have run Function Start Search beforehand so the function
+/// table is populated (an empty table simply makes every executable address
+/// synthesize, which is the intended fast path for known-bound callers). The
+/// mutating path's mid-resolve FSS re-run is idempotent — FSS is a pure rebuild
+/// of the table — so skipping it here yields the identical ResolveResult. The
+/// function that path would push is returned in [`PureResolve::created`] instead
+/// of being inserted, so one process can resolve many addresses without any
+/// cross-address state leakage.
+pub fn resolve_function_pure(prog: &Program, addr: u64) -> Result<PureResolve> {
+    let pure = |result: ResolveResult| {
+        Ok(PureResolve {
+            result,
+            created: None,
+        })
+    };
+    if !prog.contains_va(addr) {
+        return pure(fail(addr, ResolveStatus::Unmapped, "unmapped"));
+    }
+    let in_exec = prog
+        .blocks
+        .iter()
+        .any(|b| b.executable && addr >= b.va && addr < b.va.saturating_add(b.size));
+    if !in_exec && prog.function_at(addr).is_none() {
+        return pure(fail(addr, ResolveStatus::NotExecutable, "not_executable"));
+    }
+
+    if let Some(r) = try_resolve_covering(prog, addr) {
+        return pure(r);
+    }
+
+    if !in_exec {
+        return pure(fail(
+            addr,
+            ResolveStatus::NoContainingFunction,
+            "no_containing_function",
+        ));
+    }
+
+    if let Some(rf) = runtime_function_containing(prog, addr) {
+        // Mirror create_function_with_kind's existing-entry merge: stock extends
+        // an existing function's end and keeps its name; only fresh entries get
+        // the FUN_ name and pdata end.
+        let (entry, end, name) = match prog.function_at(rf.begin_va) {
+            Some(existing) => (
+                existing.entry,
+                existing.end.max(rf.end_va),
+                existing.name.clone(),
+            ),
+            None => (
+                rf.begin_va,
+                rf.end_va.max(rf.begin_va.saturating_add(1)),
+                format!("FUN_{:08x}", rf.begin_va),
+            ),
+        };
+        let f = FunctionInfo::new(entry, end, name).with_seed_kind(FunctionSeedKind::Pdata);
+        return Ok(PureResolve {
+            result: ok_from(addr, &f, ResolveStatus::Synthesized, false, vec![]),
+            created: Some(f),
+        });
+    }
+
+    let end = grow_function(prog, addr, None).max(addr.saturating_add(1));
+    let f = FunctionInfo::new(addr, end, format!("SYNTH_{addr:08x}"))
+        .with_seed_kind(FunctionSeedKind::Synthesized);
+    Ok(PureResolve {
+        result: ok_from(addr, &f, ResolveStatus::Synthesized, false, vec![]),
+        created: Some(f),
+    })
+}
+
+/// Build the `ResolveResult` the mutating path produces for a caller-supplied
+/// function (used by `decompile -addr A -end B` to skip boundary search).
+pub fn resolve_result_for_created(addr: u64, f: &FunctionInfo) -> ResolveResult {
+    ok_from(addr, f, ResolveStatus::Synthesized, false, vec![])
 }
 
 /// JSON-friendly hex fields for agent responses.

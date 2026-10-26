@@ -118,15 +118,19 @@ pub fn run(prog: &mut Program) -> Result<AnalyzerOutput> {
         raw.push(FunctionInfo::new(*entry, end, name).with_seed_kind(*kind));
     }
 
-    // Prefer earlier starts: discard any start strictly inside a previous [entry,end)
+    // Prefer earlier starts: discard any start strictly inside a previous [entry,end).
+    // `raw` is ascending with unique entries (seeds merged by VA), so a running
+    // max-end sweep is exactly equivalent to checking every previous span —
+    // O(n log n) instead of O(n^2) on large function tables.
     raw.sort_by_key(|f| f.entry);
     let mut functions = Vec::new();
+    let mut max_end = 0u64;
     for f in raw {
-        let covered = functions
-            .iter()
-            .any(|prev: &FunctionInfo| f.entry > prev.entry && f.entry < prev.end);
-        if covered {
+        if f.entry < max_end {
             continue;
+        }
+        if f.end > max_end {
+            max_end = f.end;
         }
         functions.push(f);
     }

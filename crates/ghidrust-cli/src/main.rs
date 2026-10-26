@@ -12,8 +12,11 @@ mod net_cmds;
 use ghidrust_core::{
     analyze_path, analyzer_catalog, artifact_get, artifact_query, assess_decompile_bounds,
     calls_callees, collect_callsite_hints, collect_strings_bytes, collect_strings_opts,
-    create_function, disassemble_range_opts, filter_imports, inventory_pe_dir, list_artifacts,
-    list_tree, live_process_info_json, load_path, load_path_opts, process_attach_opts,
+    create_function, create_function_with_kind, disassemble_range, disassemble_range_opts,
+    filter_imports,
+    inventory_pe_dir, list_artifacts, list_tree, live_process_info_json, load_path,
+    load_path_opts, process_attach_opts, resolve_function_pure, resolve_result_for_created,
+    resolve_result_json,
     process_break_clear, process_break_list, process_break_set,
     process_continue, process_detach, process_export_snapshot, process_launch, process_list,
     process_modules, process_pause, process_read, process_regions, process_resolve, process_resume,
@@ -27,7 +30,9 @@ use ghidrust_core::{
     SessionMode, StringCollectOpts, StringMatchMode, TreeListOpts, ANALYZER_NAMES,
     DEFAULT_PREVIEW_LIMIT,
 };
-use ghidrust_decomp::decompile_entry;
+use ghidrust_decomp::{
+    decompile_entry, decompile_instructions_stage1_full, structure_hints_from, EmitHints,
+};
 use ghidrust_il2cpp::{
     classify_at, compare_baseline, correlate, filter_entries, find_resolve_stubs,
     follow_stub_target, is_resolve_stub_va, load_baseline_map, load_metadata_flexible,
@@ -2354,7 +2359,10 @@ fn cmd_decompile(args: &[String], json: bool) -> ExitCode {
         Some(p) => PathBuf::from(p),
         None => {
             eprintln!(
- "usage: ghidrust decompile <path> [-addr HEX] [-count N] [-stage0|-stage05|-stage1] [-follow-stub] [-verbose] [-out FILE] [-json]"
+ "usage: ghidrust decompile <path> [-addr HEX] [-count N] [-stage0|-stage05|-stage1] [-follow-stub] [-verbose] [-out FILE] [-json]\n\
+             fast paths: [-end HEX] skip boundary search for -addr (known function end)\n\
+                         [-addrs-file FILE] batch: decompile N addrs in one process → out-dir/<addr>.c\n\
+                            ([-bounds-file FILE] start+end per line, [-out-dir DIR] default fn, [-parallel])"
             );
             return ExitCode::from(2);
         }
@@ -2369,6 +2377,11 @@ fn cmd_decompile(args: &[String], json: bool) -> ExitCode {
     let mut stage1 = true;
     let mut verbose = false;
     let mut follow_stub = false;
+    let mut end_override: Option<u64> = None;
+    let mut addrs_file: Option<PathBuf> = None;
+    let mut bounds_file: Option<PathBuf> = None;
+    let mut out_dir: Option<PathBuf> = None;
+    let mut parallel = false;
     let mut out_path: Option<PathBuf> = None;
     let mut i = 1;
     while i < args.len() {
@@ -2410,28 +2423,90 @@ fn cmd_decompile(args: &[String], json: bool) -> ExitCode {
                 out_path = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
+            "-end" | "--end" if i + 1 < args.len() => {
+                end_override = parse_u64(&args[i + 1]).ok();
+                i += 2;
+            }
+            "-addrs-file" | "--addrs-file" if i + 1 < args.len() => {
+                addrs_file = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "-bounds-file" | "--bounds-file" if i + 1 < args.len() => {
+                bounds_file = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "-out-dir" | "--out-dir" if i + 1 < args.len() => {
+                out_dir = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "-parallel" | "--parallel" => {
+                parallel = true;
+                i += 1;
+            }
             _ => i += 1,
         }
     }
     let _ = stage0; // suppressed; retained for future gating
     match load_path(&path) {
         Ok(mut prog) => {
-            let (mut va, resolve_meta) = match friction::resolve_and_entry(&mut prog, addr) {
-                Ok(v) => v,
-                Err(e) => {
-                    if json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&json!({
-                            "ok": false,
-                            "error": e,
-                                                       }))
-                            .unwrap()
-                        );
+            if let Some(af) = &addrs_file {
+                return cmd_decompile_batch(
+                    &mut prog,
+                    af,
+                    bounds_file.as_deref(),
+                    out_dir.as_deref(),
+                    count,
+                    parallel,
+                    verbose,
+                );
+            }
+            let (mut va, resolve_meta): (u64, Value) = if let Some(end) = end_override {
+                // Known-bounds fast path: skip Function Start Search entirely.
+                // Same synthesize-and-push semantics as the orphan branch of
+                // `resolve_function`, but the caller supplies the end. Addresses
+                // that FSS would have seeded directly (entry point / frame
+                // prologue) keep the stock FUN_ name and exact_entry status so
+                // Stage-1 text matches a stock run.
+                let Some(a) = addr else {
+                    eprintln!("-end requires -addr");
+                    return ExitCode::from(2);
+                };
+                let seeded = looks_like_fss_seed(&prog, a);
+                let f = create_function_with_kind(
+                    &mut prog,
+                    a,
+                    Some(end.max(a.saturating_add(1))),
+                    ghidrust_core::FunctionSeedKind::Synthesized,
+                    Some(if seeded {
+                        format!("FUN_{a:08x}")
                     } else {
-                        eprintln!("error: {e}");
+                        format!("SYNTH_{a:08x}")
+                    }),
+                );
+                let mut rr = resolve_result_for_created(a, &f);
+                if seeded {
+                    rr.resolve_status = ghidrust_core::ResolveStatus::ExactEntry;
+                    rr.synthesized_range = None;
+                }
+                (f.entry, resolve_result_json(&rr))
+            } else {
+                match friction::resolve_and_entry(&mut prog, addr) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&json!({
+                                "ok": false,
+                                "error": e,
+                                                           }))
+                                .unwrap()
+                            );
+                        } else {
+                            eprintln!("error: {e}");
+                        }
+                        return ExitCode::FAILURE;
                     }
-                    return ExitCode::FAILURE;
                 }
             };
             let mut follow_meta: Option<Value> = None;
@@ -2601,6 +2676,268 @@ fn cmd_decompile(args: &[String], json: bool) -> ExitCode {
             eprintln!("load error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+
+/// Cheap replica of Function Start Search's seed test for one address:
+/// image entry, `push rbp; mov rbp,rsp`, or `sub rsp,imm8` not mid-frame.
+/// Used by `decompile -end` so seeded starts keep the stock FUN_ identity
+/// without running the full scan.
+fn looks_like_fss_seed(prog: &Program, addr: u64) -> bool {
+    if prog.entry == Some(addr) {
+        return true;
+    }
+    let Some(b) = prog.read_va(addr, 4) else {
+        return false;
+    };
+    if b.len() >= 4 && b[0] == 0x55 && b[1] == 0x48 && b[2] == 0x89 && b[3] == 0xE5 {
+        return true;
+    }
+    if b.len() >= 3 && b[0] == 0x48 && b[1] == 0x83 && b[2] == 0xEC {
+        // FSS skips `sub rsp` when it directly follows `push rbp; mov rbp,rsp`.
+        if let Some(prev) = prog.read_va(addr.saturating_sub(4), 4) {
+            if prev.len() == 4
+                && prev[0] == 0x55
+                && prev[1] == 0x48
+                && prev[2] == 0x89
+                && prev[3] == 0xE5
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+/// Read an address list: one hex VA per line (`0x` optional), `#` comments.
+fn read_addr_list(path: &Path) -> Result<Vec<u64>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let l = line.split('#').next().unwrap_or("").trim();
+        if l.is_empty() {
+            continue;
+        }
+        match parse_u64(l) {
+            Ok(a) => out.push(a),
+            Err(e) => return Err(format!("bad address {l:?} in {}: {e}", path.display())),
+        }
+    }
+    Ok(out)
+}
+
+/// Read a bounds file: `start end` hex pair per line (`0x` optional).
+fn read_bounds_map(path: &Path) -> Result<std::collections::BTreeMap<u64, u64>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let mut out = std::collections::BTreeMap::new();
+    for line in text.lines() {
+        let l = line.split('#').next().unwrap_or("").trim();
+        if l.is_empty() {
+            continue;
+        }
+        let mut it = l.split_whitespace();
+        let (Some(s), Some(e)) = (it.next(), it.next()) else {
+            return Err(format!("bad bounds line {l:?} in {}", path.display()));
+        };
+        let start = parse_u64(s).map_err(|e| format!("bad start {s:?}: {e}"))?;
+        let end = parse_u64(e).map_err(|e| format!("bad end {e:?}: {e}"))?;
+        out.insert(start, end);
+    }
+    Ok(out)
+}
+
+/// Batch decompile: one process, one load, one Function Start Search, then a
+/// per-address loop with zero shared mutation. Each address resolves against
+/// exactly the post-FSS state a fresh single-address stock process sees, so
+/// per-address output matches `decompile -addr A --out F` byte for byte.
+/// Files land in `out_dir` as `<addr-hex>.c` (JSON payload, same as `-out`).
+fn cmd_decompile_batch(
+    prog: &mut Program,
+    addrs_file: &Path,
+    bounds_file: Option<&Path>,
+    out_dir: Option<&Path>,
+    count: usize,
+    parallel: bool,
+    verbose: bool,
+) -> ExitCode {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let t0 = Instant::now();
+    let addrs = match read_addr_list(addrs_file) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("addrs-file error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let bounds = match bounds_file.map(read_bounds_map) {
+        Some(Ok(m)) => m,
+        Some(Err(e)) => {
+            eprintln!("bounds-file error: {e}");
+            return ExitCode::FAILURE;
+        }
+        None => std::collections::BTreeMap::new(),
+    };
+    let out_dir = out_dir
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("fn"));
+    if let Err(e) = std::fs::create_dir_all(&out_dir) {
+        eprintln!("out-dir error: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    // One Function Start Search pass — the same table a fresh stock process
+    // builds before resolving its first address. No per-address re-runs.
+    let t_fss = Instant::now();
+    if let Err(e) = run_analyzers(prog, &["Function Start Search"]) {
+        eprintln!("analyze error: {e}");
+        return ExitCode::FAILURE;
+    }
+    let conv = if prog.format.to_ascii_lowercase().contains("pe") {
+        ghidrust_types::CallConv::Windows
+    } else {
+        ghidrust_types::CallConv::SystemV
+    };
+    let base_hints = structure_hints_from(prog);
+    let base_emit = EmitHints::from_program(prog);
+    if verbose {
+        eprintln!(
+            "batch: {} addr(s), {} function(s) from FSS in {:.2}s",
+            addrs.len(),
+            prog.analysis.functions.len(),
+            t_fss.elapsed().as_secs_f64()
+        );
+    }
+
+    let prog = &*prog;
+    let failures: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let ok_count = AtomicUsize::new(0);
+    let skip_count = AtomicUsize::new(0);
+    let work = |addr: u64| {
+        let out_path = out_dir.join(format!("{addr:x}.c"));
+        if out_path.is_file()
+            && std::fs::metadata(&out_path)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+        {
+            skip_count.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let fail = |msg: String| {
+            failures
+                .lock()
+                .unwrap()
+                .push(format!("{addr:#x}: {msg}"))
+        };
+        let pr = match resolve_function_pure(prog, addr) {
+            Ok(p) => p,
+            Err(e) => return fail(e.to_string()),
+        };
+        if !pr.result.ok {
+            return fail(format!(
+                "resolve failed: {}",
+                pr.result.reason.as_deref().unwrap_or("unknown")
+            ));
+        }
+        let va = pr.result.resolved_entry.unwrap_or(addr);
+        let mut f = match pr.created.as_ref() {
+            Some(c) => c.clone(),
+            None => match prog.function_at(va) {
+                Some(g) => g.clone(),
+                None => return fail("internal: resolved entry missing from table".into()),
+            },
+        };
+        let mut rr = pr.result.clone();
+        if let Some(end) = bounds.get(&addr).copied() {
+            // Caller-known end wins over discovered/synthesized bounds.
+            f.end = end.max(f.entry.saturating_add(1));
+            if let Some(e) = rr.function_end.as_mut() {
+                *e = f.end;
+            }
+            if let Some(sr) = rr.synthesized_range.as_mut() {
+                sr.end = f.end;
+            }
+        }
+        let name = f.name.clone();
+        let insns = match disassemble_range(prog, va, count) {
+            Ok(v) => v,
+            Err(e) => return fail(e.to_string()),
+        };
+        let emit = EmitHints::window_for(
+            &base_emit,
+            &insns,
+            pr.created.as_ref().map(|c| (c.entry, c.name.as_str())),
+        )
+        .for_function_name(&name);
+        let (d, s1) =
+            decompile_instructions_stage1_full(name, va, &insns, conv, &base_hints, &emit);
+        let sum = s1.summary();
+        let stored_end = Some(f.end);
+        let decoded_end = d.blocks.iter().map(|b| b.end).max().unwrap_or(va);
+        let honesty = assess_decompile_bounds(prog, va, stored_end, decoded_end);
+        let linear = disassemble_range_opts(prog, va, count, true)
+            .map(|r| r.insns)
+            .unwrap_or_default();
+        let callsite_hints = collect_callsite_hints(&linear);
+        let mut obj = json!({
+            "decompile": d,
+            "resolve": resolve_result_json(&rr),
+            "stage1": {
+                "loops": sum.loops,
+                "phis": sum.phis,
+                "locals": sum.locals,
+                "params": sum.params,
+                "structs": sum.structs,
+                "lift_ratio": sum.lift_ratio,
+                "goto_rate": sum.goto_rate,
+                "folded_temps": s1.folded_temps,
+                "token_count": s1.tokens.len(),
+                "total_ops": s1.coverage.total_ops,
+                "return_type": s1.types.signature.return_type.c_style(),
+                "prototype": s1.types.signature.to_prototype(),
+            },
+            "callsite_hints": callsite_hints,
+        });
+        if let Some(m) = obj.as_object_mut() {
+            if let Some(hf) = honesty.to_json_fields().as_object() {
+                for (k, v) in hf {
+                    m.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        if emit_json_to_path(&out_path, &obj) {
+            ok_count.fetch_add(1, Ordering::Relaxed);
+        } else {
+            fail(format!("write {}", out_path.display()));
+        }
+    };
+
+    if parallel {
+        use rayon::prelude::*;
+        addrs.par_iter().for_each(|&a| work(a));
+    } else {
+        for &a in &addrs {
+            work(a);
+        }
+    }
+    let fails = failures.into_inner().unwrap();
+    eprintln!(
+        "batch: {} requested, {} written, {} skipped (existing), {} failed, {:.1}s total",
+        addrs.len(),
+        ok_count.load(Ordering::Relaxed),
+        skip_count.load(Ordering::Relaxed),
+        fails.len(),
+        t0.elapsed().as_secs_f64()
+    );
+    for f in &fails {
+        eprintln!("batch-fail: {f}");
+    }
+    if fails.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 

@@ -10,6 +10,44 @@ It is **not** a Ghidra fork or wrapper. Analysis logic (loaders, decode, analyze
 
 Includes custom GPU kernels to conduct decompiling at lightning speed, this feature is experimental and in development.
 
+## Fast decompile (this branch)
+
+This branch makes per-function `decompile --addr` dramatically cheaper and adds a batch mode. The per-invocation Function Start Search (FSS) was ~80% of the CPU cost — it ran an O(n²) covered-dedup over ~70k functions and a redundant idempotent re-run on orphan addresses, for every single address. The patch fixes both, adds a known-bounds fast path, and lets one process decompile N addresses with a single load + single FSS. Output format is unchanged (stage1 JSON, byte-identical).
+
+### Usage
+
+```bash
+# default path — now ~10x cheaper per address
+ghidrust decompile BIN --addr 0xADDR --out FILE
+
+# skip boundary search entirely (bounds from .eh_frame FDEs or sorted-next)
+ghidrust decompile BIN --addr 0xADDR --end 0xEND --out FILE
+
+# recommended bulk mode: one process, one load, one FSS, N addresses -> N files
+# rayon-parallel and resume-safe (existing outputs are skipped)
+ghidrust decompile BIN --addrs-file addrs.txt --out-dir fn --parallel
+
+# optional known bounds (lines of "0xSTART 0xEND")
+ghidrust decompile BIN --addrs-file addrs.txt --bounds-file bounds.txt --out-dir fn --parallel
+```
+
+### Benchmarks
+
+30 functions of a 105 MB stripped Rust x86-64 binary, stock vs this branch:
+
+| Mode | CPU s / addr | Speedup | Output parity |
+|------|-------------|---------|---------------|
+| stock `--addr` | 30.0 | baseline | 30/30 |
+| patched `--addr` | 3.0 | 10× | 30/30 byte-identical |
+| patched `--addr --end` | 0.83 | 36× | 30/30 identical (advisory end-report fields differ) |
+| batch `--addrs-file` | amortized | ~360× | 30/30 byte-identical; 300/300 seq-vs-parallel identical |
+
+Batch wall clock: 30 addresses in 3.0 s total; 300 addresses in 3.8 s with `--parallel`. A full 135k-function corpus completes in minutes on one 32-core box (the stock one-shot loop manages ~500/min across 8 machines).
+
+### Crash fix included
+
+Stock `build_region_from` recursion (ghidrust-structure) is unbounded on pathological cyclic CFGs — nested loop/switch structuring resets the per-level visited set, so headers re-enter forever and the shipped binary aborts on such addresses. This branch caps region depth at 1024 (far above any real function): those addresses now decompile or fail cleanly, and one bad function can no longer kill a batch run (verified: 3000-address worst-slice batch = 2913 written / 87 clean decode-fails / 0 crashes; normal-function outputs unchanged).
+
 ---
 
 ## What it aims to achieve

@@ -3,7 +3,7 @@
 //! Built from a [`ghidrust_core::Program`] when available — imports, function
 //! names, RTTI class names. Never invents callees that are not in the program.
 
-use ghidrust_core::{rtti_catalog, Program};
+use ghidrust_core::{rtti_catalog, Instruction, Program};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -82,5 +82,54 @@ impl EmitHints {
         self.method_this = true;
         self.this_class = Some(class.into());
         self
+    }
+
+    /// R6: enable `this` rendering when `name` looks like `Class::Method` or
+    /// matches a known vtable class. Same rule [`crate::decompile_stage1_at`]
+    /// applies per function.
+    pub fn for_function_name(mut self, name: &str) -> Self {
+        if let Some((cls, _)) = name.split_once("::") {
+            self = self.with_method_this(cls);
+        } else if self.vtable_classes.values().any(|c| name.contains(c.as_str())) {
+            if let Some(cls) = self
+                .vtable_classes
+                .values()
+                .find(|c| name.contains(c.as_str()))
+                .cloned()
+            {
+                self = self.with_method_this(cls);
+            }
+        }
+        self
+    }
+
+    /// Compact per-function view of a full-program hints map: keeps call names
+    /// only for the direct call targets appearing in `insns` (plus `extra`,
+    /// e.g. the batch loop's synthesized current-function name), and carries
+    /// the (small) vtable class map over. Every lookup performed while emitting
+    /// this function resolves identically to the full map.
+    pub fn window_for(base: &EmitHints, insns: &[Instruction], extra: Option<(u64, &str)>) -> Self {
+        let mut call_names = BTreeMap::new();
+        for insn in insns {
+            if insn.mnemonic != "call" {
+                continue;
+            }
+            let t = insn.operands.split(',').next().unwrap_or("").trim();
+            let t = t.trim_start_matches("0x").trim_start_matches("0X");
+            if let Ok(va) = u64::from_str_radix(t, 16) {
+                if let Some(name) = base.call_names.get(&va) {
+                    call_names.insert(va, name.clone());
+                }
+            }
+        }
+        if let Some((va, name)) = extra {
+            call_names.insert(va, name.to_string());
+        }
+        EmitHints {
+            call_names,
+            method_this: false,
+            this_class: None,
+            vtable_classes: base.vtable_classes.clone(),
+        }
     }
 }

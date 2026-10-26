@@ -120,7 +120,10 @@ pub use project::{
     AnalysisSummary, Project, ProjectFileEntry, ProjectMeta, ProjectTreeModel, ProjectTreeRow,
     SavedAnalysis, PROJECT_FILE,
 };
-pub use resolve::{resolve_function, resolve_result_json, ResolveResult, ResolveStatus};
+pub use resolve::{
+    resolve_function, resolve_function_pure, resolve_result_for_created, resolve_result_json,
+    PureResolve, ResolveResult, ResolveStatus,
+};
 pub use rtti::{recover_rtti, RttiClass, RttiReport};
 pub use rtti_catalog::{
     clear_rtti_cache, enrich_class, rtti_catalog, rtti_query, RttiCatalogEntry, RttiMatchMode,

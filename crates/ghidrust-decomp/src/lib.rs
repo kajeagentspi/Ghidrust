@@ -330,24 +330,7 @@ pub fn decompile_stage1_at(
         })
         .unwrap_or_else(|| format!("FUN_{va:016x}"));
     let hints = structure_hints_from(prog);
-    let mut emit_hints = EmitHints::from_program(prog);
-    // R6: if this function's name looks like Class::Method, enable `this`.
-    if let Some((cls, _)) = name.split_once("::") {
-        emit_hints = emit_hints.with_method_this(cls);
-    } else if emit_hints
-        .vtable_classes
-        .values()
-        .any(|c| name.contains(c.as_str()))
-    {
-        if let Some(cls) = emit_hints
-            .vtable_classes
-            .values()
-            .find(|c| name.contains(c.as_str()))
-            .cloned()
-        {
-            emit_hints = emit_hints.with_method_this(cls);
-        }
-    }
+    let emit_hints = EmitHints::from_program(prog).for_function_name(&name);
     Ok(decompile_instructions_stage1_full(
         name,
         va,

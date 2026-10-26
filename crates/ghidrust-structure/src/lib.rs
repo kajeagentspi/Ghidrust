@@ -382,7 +382,7 @@ pub fn structure_function_with_hints(
         loop_stack: Vec::new(),
     };
     let mut visited: HashSet<u32> = HashSet::new();
-    let raw = ctx.build_region_from(ENTRY_BLOCK, None, &mut visited);
+    let raw = ctx.build_region_from(ENTRY_BLOCK, None, &mut visited, 0);
     let flattened = flatten_short_circuit(raw, ssa);
     // R3: `if (cond) goto return_block` → `if (cond) return` when the
     // target leaf is a Return region (early-exit polish).
@@ -603,6 +603,14 @@ fn block_containing_addr(ssa: &SsaFunction, addr: u64) -> Option<u32> {
     None
 }
 
+/// Recursion cap for [`StructCtx::build_region_from`]. Nested loop/switch
+/// structuring resets the per-level `visited` set, so pathological cyclic
+/// CFGs could recurse without bound and overflow the stack (the stock CLI
+/// aborts on such inputs). 1024 is far above any structured region depth a
+/// real function produces; past it we degrade to the same terminator region
+/// used for already-emitted blocks instead of crashing.
+const MAX_REGION_DEPTH: u32 = 1024;
+
 struct StructCtx<'a> {
     cfg: &'a Cfg,
     ssa: &'a SsaFunction,
@@ -635,7 +643,11 @@ impl<'a> StructCtx<'a> {
         start: u32,
         stop_at: Option<u32>,
         visited: &mut HashSet<u32>,
+        depth: u32,
     ) -> Region {
+        if depth >= MAX_REGION_DEPTH {
+            return self.loop_terminator_for(start);
+        }
         let mut seq: Vec<Region> = Vec::new();
         let mut cur = Some(start);
         while let Some(b) = cur {
@@ -653,7 +665,7 @@ impl<'a> StructCtx<'a> {
 
             // Loop handling.
             if let Some(l) = self.loop_at(b) {
-                let region = self.build_loop(l, visited);
+                let region = self.build_loop(l, visited, depth + 1);
                 seq.push(region);
                 cur = self.loop_exit(l);
                 continue;
@@ -673,7 +685,8 @@ impl<'a> StructCtx<'a> {
                     .map(|(sel, tgt)| {
                         let mut case_visited: HashSet<u32> = HashSet::new();
                         case_visited.insert(b);
-                        let body = self.build_region_from(*tgt, stop, &mut case_visited);
+                        let body =
+                            self.build_region_from(*tgt, stop, &mut case_visited, depth + 1);
                         for cb in case_visited {
                             visited.insert(cb);
                         }
@@ -690,7 +703,7 @@ impl<'a> StructCtx<'a> {
                     } else {
                         let mut dv: HashSet<u32> = HashSet::new();
                         dv.insert(b);
-                        let r = self.build_region_from(d, stop, &mut dv);
+                        let r = self.build_region_from(d, stop, &mut dv, depth + 1);
                         for cb in dv {
                             visited.insert(cb);
                         }
@@ -720,7 +733,8 @@ impl<'a> StructCtx<'a> {
             if succs.len() == 2 && ends_in_cbranch(block) {
                 let (then_id, else_id) = (succs[0], succs[1]);
                 let join = self.if_join(then_id, else_id, stop_at);
-                let then_branch = Box::new(self.build_region_from(then_id, join, visited));
+                let then_branch =
+                    Box::new(self.build_region_from(then_id, join, visited, depth + 1));
                 let else_branch = if let Some(join) = join {
                     if else_id == join {
                         None
@@ -729,11 +743,12 @@ impl<'a> StructCtx<'a> {
                             else_id,
                             Some(join),
                             visited,
+                            depth + 1,
                         )))
                     }
                 } else {
                     // No shared join — emit both branches with unbounded expansion.
-                    Some(Box::new(self.build_region_from(else_id, None, visited)))
+                    Some(Box::new(self.build_region_from(else_id, None, visited, depth + 1)))
                 };
                 seq.push(match else_branch {
                     Some(else_branch) => Region::IfThenElse {
@@ -861,7 +876,7 @@ impl<'a> StructCtx<'a> {
 
     /// A loop is a `While` when the header ends in a `CBranch`, a `DoWhile`
     /// when only the latch does, and a `Loop` otherwise.
-    fn build_loop(&mut self, l: &NaturalLoop, visited: &mut HashSet<u32>) -> Region {
+    fn build_loop(&mut self, l: &NaturalLoop, visited: &mut HashSet<u32>, depth: u32) -> Region {
         // Mark header + latch visited to break the back-edge cycle.
         let outer_visited = std::mem::take(visited);
         let mut inner_visited: HashSet<u32> = HashSet::new();
@@ -892,10 +907,10 @@ impl<'a> StructCtx<'a> {
         let body_region = if header_cbr {
             // Emit body starting from the loop-body successor, stopping at the
             // header itself (natural back-edge).
-            self.build_region_from(in_body, Some(l.header), &mut inner_visited)
+            self.build_region_from(in_body, Some(l.header), &mut inner_visited, depth)
         } else {
             // Body is everything reachable from header inside the loop.
-            self.build_region_from(l.header, Some(l.header), &mut inner_visited)
+            self.build_region_from(l.header, Some(l.header), &mut inner_visited, depth)
         };
 
         self.loop_stack.pop();
